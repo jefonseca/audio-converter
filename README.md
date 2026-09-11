@@ -92,6 +92,16 @@ El paquete instala el comando en `/usr/bin/audio-converter` y declara `bash` y
 `ffmpeg` como dependencias. `zenity` y `kdialog` son recomendaciones
 opcionales.
 
+## Releases
+
+Al publicar un tag con formato `vX.Y.Z`, GitHub Actions construye el paquete
+Debian y crea automáticamente un GitHub Release con el archivo `.deb` adjunto.
+
+```bash
+git tag v1.2.3
+git push origin v1.2.3
+```
+
 ## Licencia
 
 MIT. Consulta `LICENSE`.
