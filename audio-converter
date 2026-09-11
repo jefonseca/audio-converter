@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+readonly VERSION='0.0.1'
+readonly PROGRAM=${0##*/}
+
+usage() {
+    cat <<EOF
+Uso: $PROGRAM [opciones] CARPETA
+
+Convierte archivos de audio de CARPETA a M4A usando ffmpeg.
+
+Opciones:
+  -c, --config ARCHIVO       Archivo de configuración alternativo
+      --codec CODEC          Codec de audio (por defecto: libfdk_aac)
+      --profile PERFIL       Perfil del codec (por defecto: aac_he_v2)
+      --no-profile           No pasar un perfil al codec
+  -b, --bitrate BITRATE      Bitrate (por defecto: 48k)
+  -e, --extension EXTENSION  Extensión de entrada (por defecto: mp3)
+  -h, --help                 Mostrar esta ayuda
+  -V, --version              Mostrar la versión
+
+Los argumentos de la línea de órdenes tienen prioridad sobre el archivo de
+configuración. El archivo predeterminado se crea automáticamente en:
+  \${XDG_CONFIG_HOME:-\$HOME/.config}/audio-converter/config
+EOF
+}
+
+error() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 2
+}
+
+config_file=''
+config_argument=0
+args=("$@")
+
+# Primera pasada: localizar --config antes de leer la configuración.
+for ((i = 0; i < ${#args[@]}; i++)); do
+    case ${args[i]} in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -V|--version)
+            printf '%s %s\n' "$PROGRAM" "$VERSION"
+            exit 0
+            ;;
+        -c|--config)
+            config_argument=1
+            ((i += 1))
+            (( i < ${#args[@]} )) || error "${args[i - 1]} requiere un valor"
+            config_file=${args[i]}
+            ;;
+        --config=*)
+            config_argument=1
+            config_file=${args[i]#*=}
+            ;;
+    esac
+done
+
+if (( config_argument )) && [[ -z $config_file ]]; then
+    error 'la ruta del archivo de configuración está vacía'
+fi
+if [[ -z $config_file ]]; then
+    config_file="${XDG_CONFIG_HOME:-$HOME/.config}/audio-converter/config"
+fi
+[[ -n $config_file ]] || error 'la ruta del archivo de configuración está vacía'
+
+config_parent=${config_file%/*}
+[[ $config_parent == "$config_file" ]] && config_parent='.'
+
+create_config() {
+    umask 077
+    mkdir -p -- "$config_parent"
+    cat > "$config_file" <<'EOF'
+# Configuración de audio-converter. Los argumentos CLI tienen prioridad.
+CODEC='libfdk_aac'
+PROFILE='aac_he_v2'
+BITRATE='48k'
+EXTENSION='mp3'
+EOF
+}
+
+if [[ ! -e $config_file ]]; then
+    create_config
+elif [[ ! -f $config_file ]]; then
+    error "la ruta de configuración no es un archivo: $config_file"
+fi
+
+CODEC='libfdk_aac'
+PROFILE='aac_he_v2'
+BITRATE='48k'
+EXTENSION='mp3'
+# shellcheck disable=SC1090
+source "$config_file"
+
+input_dir=''
+while (( $# )); do
+    case $1 in
+        -c|--config)
+            (( $# >= 2 )) || error "$1 requiere un valor"
+            shift 2
+            ;;
+        --config=*)
+            shift
+            ;;
+        --codec)
+            (( $# >= 2 )) || error '--codec requiere un valor'
+            CODEC=$2
+            shift 2
+            ;;
+        --codec=*)
+            CODEC=${1#*=}
+            shift
+            ;;
+        --profile)
+            (( $# >= 2 )) || error '--profile requiere un valor'
+            PROFILE=$2
+            shift 2
+            ;;
+        --profile=*)
+            PROFILE=${1#*=}
+            shift
+            ;;
+        --no-profile)
+            PROFILE=''
+            shift
+            ;;
+        -b|--bitrate)
+            (( $# >= 2 )) || error "$1 requiere un valor"
+            BITRATE=$2
+            shift 2
+            ;;
+        --bitrate=*)
+            BITRATE=${1#*=}
+            shift
+            ;;
+        -e|--extension)
+            (( $# >= 2 )) || error "$1 requiere un valor"
+            EXTENSION=$2
+            shift 2
+            ;;
+        --extension=*)
+            EXTENSION=${1#*=}
+            shift
+            ;;
+        --)
+            shift
+            [[ $# == 1 ]] || error 'se esperaba una sola carpeta'
+            input_dir=$1
+            shift
+            ;;
+        -*)
+            error "opción desconocida: $1"
+            ;;
+        '')
+            error 'la carpeta de entrada no puede estar vacía'
+            ;;
+        *)
+            [[ -z $input_dir ]] || error 'solo se admite una carpeta de entrada'
+            input_dir=$1
+            shift
+            ;;
+    esac
+done
+
+[[ -n $input_dir ]] || error 'falta la carpeta de entrada'
+[[ -d $input_dir ]] || error "no existe la carpeta: $input_dir"
+command -v ffmpeg >/dev/null 2>&1 || error 'no se encontró ffmpeg en el PATH'
+[[ -n $CODEC ]] || error 'CODEC no puede estar vacío'
+[[ -n $BITRATE ]] || error 'BITRATE no puede estar vacío'
+
+extension=${EXTENSION#.}
+[[ $extension =~ ^[[:alnum:]_+-]+$ ]] || \
+    error 'EXTENSION solo puede contener letras, números, _, + y -'
+
+cd -- "$input_dir"
+shopt -s nullglob nocaseglob
+files=(*."$extension")
+
+if (( ${#files[@]} == 0 )); then
+    printf 'No se encontraron archivos .%s en %s.\n' "$extension" "$PWD"
+    exit 0
+fi
+
+output_dir="converted-$(date +%Y%m%d-%H%M%S)"
+mkdir -- "$output_dir"
+total=${#files[@]}
+temporary=''
+failures=0
+interface='terminal'
+if command -v zenity >/dev/null 2>&1; then
+    interface='zenity'
+elif command -v kdialog >/dev/null 2>&1; then
+    interface='kdialog'
+fi
+
+cleanup() {
+    [[ -z $temporary ]] || rm -f -- "$temporary"
+}
+trap 'cleanup; exit 130' INT TERM
+
+convert_files() {
+    local index=0 file name output message
+    local -a ffmpeg_args=(-c:a "$CODEC" -b:a "$BITRATE" -ar 48000 -ac 2)
+    [[ -z $PROFILE ]] || ffmpeg_args+=(-profile:a "$PROFILE")
+
+    for file in "${files[@]}"; do
+        ((index += 1))
+        name=${file%.*}
+        output="$output_dir/$name.m4a"
+        temporary="$output_dir/.$name.part-${BASHPID}.m4a"
+        message="Convirtiendo archivo $index de $total: $file"
+
+        if [[ -e $output ]]; then
+            printf 'Error: colisión de nombres, no se sobrescribe: %s\n' "$output" >&2
+            ((failures += 1))
+            continue
+        fi
+
+        case $interface in
+            zenity)
+                printf '%s\n' "$((index * 100 / total))"
+                printf '# %s\n' "$message"
+                ;;
+            kdialog)
+                kdialog --title 'Audio converter' --passivepopup "$message" 2 \
+                    >/dev/null 2>&1 &
+                ;;
+            terminal)
+                printf '%s\n' "$message"
+                ;;
+        esac
+
+        if ffmpeg -hide_banner -loglevel error -i "$file" \
+            -map 0:a:0 -vn -map_metadata 0 "${ffmpeg_args[@]}" "$temporary"; then
+            if mv -- "$temporary" "$output"; then
+                temporary=''
+            else
+                printf 'Error al guardar: %s\n' "$output" >&2
+                rm -f -- "$temporary"
+                temporary=''
+                ((failures += 1))
+            fi
+        else
+            printf 'Error al convertir: %s\n' "$file" >&2
+            rm -f -- "$temporary"
+            temporary=''
+            ((failures += 1))
+        fi
+    done
+
+    [[ $interface == zenity ]] && printf '100\n'
+    return "$((failures == 0 ? 0 : 1))"
+}
+
+if [[ $interface == zenity ]]; then
+    convert_files | zenity --progress --title='Audio converter' \
+        --text='Iniciando...' --percentage=0 --auto-close --no-cancel
+else
+    convert_files
+fi
+
+printf 'Proceso terminado. Salida: %s/%s\n' "$PWD" "$output_dir"

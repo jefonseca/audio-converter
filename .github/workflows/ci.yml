@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+      - name: Shell syntax and lint
+        run: shellcheck audio-converter packaging/build-deb.sh tests/test_audio_converter.sh
+      - name: Tests
+        run: ./tests/test_audio_converter.sh
+      - name: Build Debian package
+        run: ./packaging/build-deb.sh 0.0.1

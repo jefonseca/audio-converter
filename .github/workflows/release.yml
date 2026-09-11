@@ -1,0 +1,22 @@
+name: Debian release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Debian package
+        run: ./packaging/build-deb.sh "${GITHUB_REF_NAME#v}"
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-converter-deb
+          path: '*.deb'
